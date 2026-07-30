@@ -541,6 +541,7 @@ func TestPVCAppliesTo(t *testing.T) {
 		t,
 		velero.ResourceSelector{
 			IncludedResources: []string{"persistentvolumeclaims"},
+			LabelSelector:     velerov1api.VolumeSnapshotLabel,
 		},
 		selector,
 	)
