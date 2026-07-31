@@ -49,7 +49,7 @@ func (g *DefaultServerStatusGetter) GetServerStatus(kbClient kbclient.Client) (*
 	err := wait.PollUntilContextCancel(g.Context, 250*time.Millisecond, true, func(ctx context.Context) (bool, error) {
 		updated := &velerov1api.ServerStatusRequest{}
 		if err := kbClient.Get(ctx, key, updated); err != nil {
-			return false, err
+			return false, kbclient.IgnoreNotFound(err)
 		}
 
 		if updated.Status.Phase == velerov1api.ServerStatusRequestPhaseProcessed {
