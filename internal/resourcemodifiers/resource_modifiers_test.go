@@ -1907,3 +1907,201 @@ func TestJSONPatch_ToString(t *testing.T) {
 		})
 	}
 }
+
+// TestCNIAnnotationStrippingViaResourceModifier validates the resource modifier
+// mechanism for stripping well-known CNI-injected pod annotations during restore,
+// as proposed in https://github.com/velero-io/velero/issues/9719.
+//
+// When pods are backed up, CNI plugins (OVN-Kubernetes, Multus) inject annotations
+// containing stale networking state (IPs, MACs, routes). Restoring these stale
+// values can break workloads in the new cluster. This test verifies that a
+// ResourceModifier configured with JSON merge patches can correctly strip these
+// annotations, simulating the server-side default restore resource modifier behavior.
+func TestCNIAnnotationStrippingViaResourceModifier(t *testing.T) {
+	// CNI annotations that need to be stripped during restore (per issue #9719)
+	const (
+		ovnAnnotation     = "k8s.ovn.org/pod-networks"
+		multusAnnotation1 = "k8s.v1.cni.cncf.io/network-status"
+		multusAnnotation2 = "k8s.v1.cni.cncf.io/networks-status"
+	)
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	logger := logrus.New()
+
+	// Helper: build an unstructured Pod with given annotations
+	buildPod := func(name, namespace string, annotations map[string]string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata": map[string]interface{}{
+					"name":      name,
+					"namespace": namespace,
+				},
+				"spec": map[string]interface{}{
+					"containers": []interface{}{
+						map[string]interface{}{
+							"name":  "app",
+							"image": "nginx:latest",
+						},
+					},
+				},
+			},
+		}
+		if len(annotations) > 0 {
+			annMap := make(map[string]interface{}, len(annotations))
+			for k, v := range annotations {
+				annMap[k] = v
+			}
+			_ = unstructured.SetNestedMap(obj.Object, annMap, "metadata", "annotations")
+		}
+		return obj
+	}
+
+	// ResourceModifier that strips all three well-known CNI annotations from pods.
+	// This is what a server-side default modifier for issue #9719 would look like.
+	cniStrippingModifier := &ResourceModifiers{
+		Version: ResourceModifierSupportedVersionV1,
+		ResourceModifierRules: []ResourceModifierRule{
+			{
+				Conditions: Conditions{
+					GroupResource: "pods",
+				},
+				MergePatches: []JSONMergePatch{
+					{
+						PatchData: `{"metadata":{"annotations":{"k8s.ovn.org/pod-networks":null,"k8s.v1.cni.cncf.io/network-status":null,"k8s.v1.cni.cncf.io/networks-status":null}}}`,
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                string
+		modifier            *ResourceModifiers
+		inputObj            *unstructured.Unstructured
+		groupResource       string
+		expectedAnnotations map[string]string
+		expectErrors        bool
+	}{
+		{
+			name:          "strips all three CNI annotations when all are present on a pod",
+			modifier:      cniStrippingModifier,
+			groupResource: "pods",
+			inputObj: buildPod("test-pod", "default", map[string]string{
+				ovnAnnotation:     `[{"default":{"ip_addresses":["10.128.0.5/23"],"mac_address":"0a:58:0a:80:00:05"}}]`,
+				multusAnnotation1: `[{"name":"ovn-kubernetes","interface":"eth0","ips":["10.128.0.5"]}]`,
+				multusAnnotation2: `[{"name":"ovn-kubernetes","interface":"eth0","ips":["10.128.0.5"]}]`,
+				"app":             "my-workload",
+			}),
+			// non-CNI annotation must be preserved; CNI annotations must be gone
+			expectedAnnotations: map[string]string{
+				"app": "my-workload",
+			},
+		},
+		{
+			name:          "strips only OVN-Kubernetes annotation when only it is present",
+			modifier:      cniStrippingModifier,
+			groupResource: "pods",
+			inputObj: buildPod("ovn-only-pod", "production", map[string]string{
+				ovnAnnotation: `[{"default":{"ip_addresses":["192.168.1.10/24"],"mac_address":"de:ad:be:ef:00:01"}}]`,
+				"team":        "platform",
+			}),
+			expectedAnnotations: map[string]string{
+				"team": "platform",
+			},
+		},
+		{
+			name:          "strips Multus network-status annotation when only it is present",
+			modifier:      cniStrippingModifier,
+			groupResource: "pods",
+			inputObj: buildPod("multus-pod", "staging", map[string]string{
+				multusAnnotation1: `[{"name":"macvlan-conf","interface":"net1","ips":["10.10.10.2"]}]`,
+				"version":         "v2",
+			}),
+			expectedAnnotations: map[string]string{
+				"version": "v2",
+			},
+		},
+		{
+			name:          "is a no-op on pods without any CNI annotations",
+			modifier:      cniStrippingModifier,
+			groupResource: "pods",
+			inputObj: buildPod("clean-pod", "kube-system", map[string]string{
+				"component": "apiserver",
+				"tier":      "control-plane",
+			}),
+			// No CNI annotations to strip; non-CNI annotations must remain
+			expectedAnnotations: map[string]string{
+				"component": "apiserver",
+				"tier":      "control-plane",
+			},
+		},
+		{
+			name:          "does not modify non-pod resources even if they carry CNI-like annotation keys",
+			modifier:      cniStrippingModifier,
+			groupResource: "configmaps",
+			inputObj: &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "ConfigMap",
+					"metadata": map[string]interface{}{
+						"name":      "cni-config",
+						"namespace": "kube-system",
+						"annotations": map[string]interface{}{
+							ovnAnnotation: "some-value",
+						},
+					},
+				},
+			},
+			// Annotation must survive because the modifier targets pods, not configmaps
+			expectedAnnotations: map[string]string{
+				ovnAnnotation: "some-value",
+			},
+		},
+		{
+			name: "namespace-scoped modifier does not strip CNI annotations in non-target namespaces",
+			// This test covers the per-namespace opt-out question from issue #9719:
+			// operators should be able to limit stripping to specific namespaces.
+			modifier: &ResourceModifiers{
+				Version: ResourceModifierSupportedVersionV1,
+				ResourceModifierRules: []ResourceModifierRule{
+					{
+						Conditions: Conditions{
+							GroupResource: "pods",
+							Namespaces:    []string{"prod", "staging"},
+						},
+						MergePatches: []JSONMergePatch{
+							{
+								PatchData: `{"metadata":{"annotations":{"k8s.ovn.org/pod-networks":null}}}`,
+							},
+						},
+					},
+				},
+			},
+			groupResource: "pods",
+			// Pod is in "dev" namespace – modifier must NOT fire
+			inputObj: buildPod("dev-pod", "dev", map[string]string{
+				ovnAnnotation: `[{"default":{"ip_addresses":["172.16.0.1/24"]}}]`,
+				"env":         "development",
+			}),
+			expectedAnnotations: map[string]string{
+				ovnAnnotation: `[{"default":{"ip_addresses":["172.16.0.1/24"]}}]`,
+				"env":         "development",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errs := tt.modifier.ApplyResourceModifierRules(tt.inputObj, tt.groupResource, scheme, logger)
+			require.Empty(t, errs, "unexpected errors applying CNI stripping modifier: %v", errs)
+
+			gotAnnotations := tt.inputObj.GetAnnotations()
+			assert.Equal(t, tt.expectedAnnotations, gotAnnotations,
+				"annotation mismatch after applying CNI stripping resource modifier")
+		})
+	}
+}
