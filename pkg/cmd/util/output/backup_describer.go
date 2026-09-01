@@ -173,7 +173,7 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 	}
 
 	d.Println()
-	s = emptyDisplay
+	s := emptyDisplay
 	if spec.LabelSelector != nil {
 		s = metav1.FormatLabelSelector(spec.LabelSelector)
 	}
